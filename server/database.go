@@ -18,6 +18,11 @@ func InitDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	// Enable WAL mode for better concurrency
+	if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		log.Printf("Warning: failed to set WAL mode: %v", err)
+	}
+
 	// Test connection
 	if err = db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)

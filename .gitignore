@@ -31,4 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
+# SQLite databases and WAL files
+*.db
+*.db-wal
+*.db-shm
+
 docs/

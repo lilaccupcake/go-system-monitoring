@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -19,10 +20,19 @@ var WebSocketUpgrader = websocket.Upgrader{
 	},
 }
 
+// Heartbeat configuration
+const (
+	PingPeriod  = 30 * time.Second // Gửi ping mỗi 30 giây
+	PongWait    = 10 * time.Second // Đợi pong tối đa 10 giây
+	WriteWait   = 5 * time.Second  // Timeout cho write
+	ReadTimeout = 60 * time.Second // Read timeout tổng thể
+)
+
 // WebSocketClient đại diện cho một kết nối client
 type WebSocketClient struct {
-	conn *websocket.Conn
-	send chan []byte
+	conn         *websocket.Conn
+	send         chan []byte
+	lastPongTime time.Time // Để track lần nhận pong cuối
 }
 
 // WebSocketHub quản lý tất cả client connections
@@ -99,8 +109,9 @@ func (h *WebSocketHub) WebSocketHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	client := &WebSocketClient{
-		conn: conn,
-		send: make(chan []byte, 256),
+		conn:         conn,
+		send:         make(chan []byte, 256),
+		lastPongTime: time.Now(),
 	}
 
 	h.register <- client
@@ -108,6 +119,8 @@ func (h *WebSocketHub) WebSocketHandler(w http.ResponseWriter, r *http.Request) 
 	// Khởi chạy goroutines cho read và write
 	go client.writePump(h)
 	go client.readPump(h)
+	// Khởi chạy goroutine monitor để gửi ping định kỳ
+	go client.pingPump(h)
 }
 
 // readPump đọc messages từ client
@@ -117,21 +130,38 @@ func (c *WebSocketClient) readPump(h *WebSocketHub) {
 		c.conn.Close()
 	}()
 
+	// Set read deadline
+	c.conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+	// Set pong handler để reset deadline khi nhận pong
+	c.conn.SetPongHandler(func(string) error {
+		c.lastPongTime = time.Now()
+		c.conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+		return nil
+	})
+
 	for {
-		_, _, err := c.conn.ReadMessage()
+		messageType, _, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				log.Printf("WebSocket error: %v", err)
 			}
 			break
 		}
-		// Agent không gửi message qua WebSocket, nên có thể bỏ qua
+		// Xử lý pong message (nếu có)
+		if messageType == websocket.PongMessage {
+			c.lastPongTime = time.Now()
+			continue
+		}
+		// Frontend không gửi message, bỏ qua
 	}
 }
 
 // writePump gửi messages đến client
-func (c *WebSocketClient) writePump(h *WebSocketHub) {
+func (c *WebSocketClient) writePump(_ *WebSocketHub) {
 	defer c.conn.Close()
+
+	// Set write deadline
+	c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
 
 	for {
 		message, ok := <-c.send
@@ -141,8 +171,33 @@ func (c *WebSocketClient) writePump(h *WebSocketHub) {
 			return
 		}
 
+		// Reset write deadline trước mỗi lần write
+		c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
+
 		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 			log.Printf("Error writing message: %v", err)
+			return
+		}
+	}
+}
+
+// pingPump gửi ping định kỳ để kiểm tra kết nối
+func (c *WebSocketClient) pingPump(_ *WebSocketHub) {
+	ticker := time.NewTicker(PingPeriod)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Kiểm tra nếu client không phản hồi pong trong PongWait
+		if time.Since(c.lastPongTime) > PongWait {
+			log.Printf("Client ping timeout, closing connection")
+			c.conn.Close()
+			return
+		}
+
+		// Gửi ping message
+		c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
+		if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			log.Printf("Error sending ping: %v", err)
 			return
 		}
 	}
